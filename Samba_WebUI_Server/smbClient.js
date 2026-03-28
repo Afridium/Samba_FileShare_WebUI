@@ -1,11 +1,13 @@
 require('dotenv').config();
-const { default: SMB2 } = require("@marsaud/smb2");
+const SMB2 = require("@marsaud/smb2");
 
-const smbclient = new SMB2({
+const options = {
     share: process.env.SMB_SHARE,
-    domain: process.env.SMB_DOMAIN,
     username: process.env.SMB_USER,
-    password: process.env.SMB_PASS
-})
+    password: process.env.SMB_PASS,
+    domain: process.env.SMB_DOMAIN || 'WORKGROUP'
+}
+
+const smbclient = new SMB2(options)
 
 module.exports = smbclient;
