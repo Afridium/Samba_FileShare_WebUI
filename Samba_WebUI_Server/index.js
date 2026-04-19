@@ -5,11 +5,31 @@ const fs = require('fs');
 const path = require('path');
 const smbClient = require('./smbClient');
 const port = process.env.PORT || 5000;
+const os = require('os');
 
 
+function getLocalIp() {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            // Skip over non-IPv4 and internal (i.e. 127.0.0.1) addresses
+            if (iface.family === 'IPv4' && !iface.internal) {
+                return iface.address;
+            }
+        }
+    }
+    return 'localhost';
+}
+
+const CURRENT_IP = getLocalIp();
 
 const app = express();
-app.use(cors());
+app.use(cors({
+    origin: '*', // Allows your phone to connect
+    methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true
+}));
 app.use(express.json());
 
 const upload = multer({ dest: 'uploads/' });
@@ -20,7 +40,6 @@ app.get('/files', (req, res) => {
 
     smbClient.readdir(directory, (err, files) => {
         if (err) return res.status(500).send(err);
-        console.log(files);
 
         let result = [];
 
@@ -36,12 +55,20 @@ app.get('/files', (req, res) => {
                 } else {
                     result.push({
                         name: file,
-                        isFolder: stats.isDirectory()
+                        isFolder: stats.isDirectory(),
+                        mtime: stats.mtime
                     });
                 }
 
                 pending--;
-                if (!pending) res.json(result);
+                if (pending === 0) {
+                    //THE SORTING LOGIC
+                    result.sort((a, b) => {
+                        return new Date(b.mtime) - new Date(a.mtime);
+                    });
+
+                    res.json(result);
+                }
             });
         });
     });
@@ -49,13 +76,7 @@ app.get('/files', (req, res) => {
 
 //downloading
 app.get('/download', (req, res) => {
-    /*
-    Step1: get the file path
-    Step2: extract file name from the path using split for downloads
-    Step3: tell the browser to download the file instead of displaying it
-    step4: ask smb client to open a read stream
-    step5: pipe the sambas tream directly into the express response stream
-    */
+    
     const filePath = req.query.path; //step1
     if (!filePath) return res.status(500).send({ error: "File path is required" });
 
@@ -78,78 +99,95 @@ app.get('/download', (req, res) => {
 
 //uploading
 //we will use upload.single('file') to tell multer to look for an uploaded file named file
+
+
+//uploading
 app.post('/upload', upload.single('file'), (req, res) => {
-    /*
-    step1: verify a file was actually uploaded
-    step2: get the target directory on the samba share
-    step3: read from the temporary file multer just created (req.file.path)
-    step4: ask smb client to open a write stream
-    */
     if (!req.file) {
         return res.status(500).send({ error: "No file was uploaded!" });
-    } //step1
-
-    //step2
+    }
+    const parsedFile = path.parse(req.file.originalname);
+    const uniqueFileName = `${parsedFile.name}_${Date.now()}${parsedFile.ext}`;
     const targetDir = req.query.path || '';
-    const targetPath = targetDir == '' ? req.file.originalname : `${targetDir}\\${req.file.originalname}`;
+    const targetPath = targetDir == '' ? uniqueFileName : `${targetDir}\\${uniqueFileName}`;
 
     console.log(`Uploading ${req.file.originalname} to ${targetPath}...`);
 
-    //step3
-    const localReadStream = fs.createReadStream(req.file.path);
-
-    //step4
-    smbClient.createWriteStream(targetPath, (err, smbWriteStream) => {
-        if (err) {
-            console.log(`Error creating stream: `, err);
+    //Read the temp file into memory
+    fs.readFile(req.file.path, (readErr, data) => {
+        if (readErr) {
+            console.error("Local read error:", readErr);
             fs.unlinkSync(req.file.path);
-            return res.status(500).send({ error: ' cannot upload the file' });
+            return res.status(500).send({ error: "Could not process file locally." });
         }
-        localReadStream.pipe(smbWriteStream);
 
-        localReadStream.on('end', () => {
-            console.log(`Upload Successful: ${req.file.originalname} `);
-            fs.unlinkSync(req.file.path);
+        //Write the entire file directly to Samba in one go
+        smbClient.writeFile(targetPath, data, (writeErr) => {
+            // Always clean up the local temp file when done
+            if (fs.existsSync(req.file.path)) {
+                fs.unlinkSync(req.file.path);
+            }
+
+            // Handle Errors
+            if (writeErr) {
+                // Handle actual duplicate files
+                if (writeErr.code === 'STATUS_OBJECT_NAME_COLLISION') {
+                    return res.status(400).send({ error: "File already exists!" });
+                }
+
+                // INTERCEPT AND IGNORE THE FAKE ERROR
+                if (writeErr.code === 'STATUS_PENDING') {
+                    console.log(`Upload finished in background (Ignored STATUS_PENDING): ${uniqueFileName}`);
+                    // Tell the frontend it was a success!
+                    return res.send({ message: "Upload Succeed" });
+                }
+
+                //Handle actual real crashes
+                console.error("Samba write error:", writeErr);
+                return res.status(500).send({ error: "Failed to save file to Samba." });
+            }
+
+            // Normal Success
+            console.log(`Upload Successful: ${uniqueFileName}`);
             res.send({ message: "Upload Succeed" });
         });
-        localReadStream.on('error', (streamErr) => {
-            console.error(`Error piping file:`, streamErr);
-            fs.unlinkSync(req.file.path);
-            res.status(500).send({ error: "Error transferring file" });
-        });
-    })
-
-})
-
+    });
+});
 //delete
+
+
 app.delete('/delete', (req, res) => {
     const filePath = req.query.path;
     const isFolder = req.query.isFolder === 'true';
 
-    if (!filePath) {
-        console.log("No file found");
-        return res.status(500).send({ error: "no filepath was found" })
-    }
+    if (!filePath) return res.status(400).send({ error: "no filepath was found" });
 
-    if (isFolder) {
-        smbClient.rmdir(filePath, (err) => {
+    // Internal helper for retrying
+    const attemptDelete = (retriesLeft) => {
+        const action = isFolder ? smbClient.rmdir : smbClient.unlink;
+
+        action.call(smbClient, filePath, (err) => {
             if (err) {
-                console.log("Cannot delete: ", err);
-                return res.status(500).send({ error: "deletion failed" })
+                // If it's a sharing violation, wait 300ms and try again
+                if (err.code === 'STATUS_SHARING_VIOLATION' && retriesLeft > 0) {
+                    console.log(`Lock detected on ${filePath}. Retrying... (${retriesLeft} attempts left)`);
+                    return setTimeout(() => attemptDelete(retriesLeft - 1), 300);
+                }
+
+                console.error("Delete failed:", err);
+                return res.status(500).send({ error: "Deletion failed after retries", details: err.code });
             }
-            res.send({ message: "Folder deleted successfully!" });
+            
+            res.send({ message: isFolder ? "Folder deleted!" : "File deleted!" });
         });
+    };
 
-    } else {
-        smbClient.unlink(filePath, (err) => {
-            if (err) {
-                console.log("Cannot delete: ", err);
-                return res.status(500).send({ error: "deletion failed" })
-            }
-            res.send({ message: "File deleted successfully!" });
-        })
-    }
-})
-app.listen(port, () => {
-    console.log(`Server is running at the port ${port}`);
-})
+    attemptDelete(5); // Try 5 times before giving up
+});
+app.listen(port, '0.0.0.0', () => {
+    console.log(`-----------------------------------------`);
+    console.log(`Server is running!`);
+    console.log(`Local:   http://localhost:5000`);
+    console.log(`Network: http://${CURRENT_IP}:5000`);
+    console.log(`-----------------------------------------`);
+});
